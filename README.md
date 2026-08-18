@@ -133,6 +133,16 @@ node dsh-guard.mjs uninstall --profile web
 
 ---
 
+## 故障排查速查表
+
+| 症状 | 可能原因 | 处理 |
+|---|---|---|
+| `Cannot read properties of undefined (reading 'prepare')` | 核心包重复副本（Symbol 隔离） | `node dsh-guard.mjs fix --profile web` |
+| `duplicate prefix route "/sidebar/api"` 启动崩 | 合并插件 double-mount | `node dsh-guard.mjs fix --profile web`（自动补 disabled） |
+| `unknown to this harness and not marked ignorable` | 插件事件缺 ignorable 标记 | 需更新该插件/补丁（dsh-guard 报告不擅改） |
+| `corrupt Zstandard session log` 启动崩 | 手动改过 session.jsonl.zstd 破坏帧结构 | 用原始备份恢复（dsh-guard 不擅改数据） |
+| 插件列表显示"未声明 dsh 元数据" | 插件包缺 dsh 字段（preset 误装为插件） | 这是形态问题，dsh-guard 仅提示 |
+
 ## 开发
 
 ```bash

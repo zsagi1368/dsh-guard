@@ -139,9 +139,12 @@ node dsh-guard.mjs uninstall --profile web
 # 项目位置不限；改动后
 node --check dsh-guard.mjs
 node dsh-guard.mjs --help
+
+# 自动化测试（在 /tmp 临时 fixture 上跑，不碰真实 profile）
+node test/run.mjs
 ```
 
-测试环境本仓库用：WSL + Windows Node 双端（`I:\` 与 `/mnt/i/` 路径均验证过）。
+测试覆盖：clean 通过 / 核心副本检出+修复 / double-mount 检出+修复 / patch 不存在时新建 / install-uninstall 往返 / 幂等。当前 20/20 通过。
 
 ## License
 

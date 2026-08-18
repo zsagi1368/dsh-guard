@@ -29,6 +29,7 @@
 
 import { existsSync, readFileSync, writeFileSync, readdirSync, mkdirSync,
          statSync, lstatSync, symlinkSync, renameSync } from "node:fs";
+import { zstdDecompressSync } from "node:zlib";
 import { join, dirname, basename, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -77,23 +78,20 @@ function warn(msg) { log("warn", msg); }
 function info(msg) { log("info", msg); }
 function error(msg) { log("error", msg); }
 
-/** 找 DSH_HOME（.dsh 根目录）。WSL/Windows 双环境皆可。 */
+/** 找 DSH_HOME（.dsh 根目录）。WSL/Windows 双环境皆可。
+ * 优先级：显式 DSH_HOME > WSL Windows 侧 ~/.dsh > USERPROFILE > 原生 ~/.dsh */
 function findDshHome() {
+  if (process.env.DSH_HOME && existsSync(process.env.DSH_HOME)) return resolve(process.env.DSH_HOME);
   const candidates = [];
-  if (process.env.DSH_HOME) candidates.push(process.env.DSH_HOME);
-  candidates.push(join(homedir(), ".dsh"));                      // 原生(WSL: /home/z、Win: C:\Users\X)
-  if (process.env.USERPROFILE) candidates.push(join(process.env.USERPROFILE, ".dsh")); // WSL 里取 Windows 用户
+  if (process.env.USERPROFILE) candidates.push(join(process.env.USERPROFILE, ".dsh")); // WSL 取 Windows 用户
   // WSL 下的 Windows 侧常见位置
-  if (process.env.WSL_DISTRO_NAME) {
-    const users = ["/mnt/c/Users"];
-    for (const base of users) {
-      if (!existsSync(base)) continue;
-      for (const u of readdirSync(base)) {
-        const p = join(base, u, ".dsh");
-        if (existsSync(join(p, "profiles"))) candidates.unshift(p); // 有 profiles 的优先
-      }
+  if (process.env.WSL_DISTRO_NAME && existsSync("/mnt/c/Users")) {
+    for (const u of readdirSync("/mnt/c/Users")) {
+      const p = join("/mnt/c/Users", u, ".dsh");
+      if (existsSync(join(p, "profiles"))) candidates.unshift(p); // 有 profiles 的优先
     }
   }
+  candidates.push(join(homedir(), ".dsh")); // 原生(WSL: /home/z)
   for (const cand of candidates) {
     if (cand && existsSync(cand)) return resolve(cand);
   }
@@ -196,18 +194,21 @@ function applyDoubleMountFixes(rules, profileDir) {
   const patchFile = join(profileDir, "cordis.patch.yml");
   const backupRoot = backupDir(profileDir);
   const applied = [];
-  let text = existsSync(patchFile) ? readFileSync(patchFile, "utf8") : "";
+  const patchExists = existsSync(patchFile);
+  let text = patchExists ? readFileSync(patchFile, "utf8") : "";
   for (const rule of rules) {
     const re = new RegExp(`-\\s*id:\\s*${escapeRegExp(rule.entryId)}\\s*\\n[ \\t]+disabled:\\s*true`);
     if (re.test(text)) continue;
     const block = `\n${GUARD_MARK} disabled ${rule.entryId}\n# ${rule.why}\n- id: ${rule.entryId}\n  disabled: true\n`;
     if (!text.endsWith("\n")) text += "\n";
-    const backup = join(backupRoot, `patch-${rule.entryId}-${Date.now()}`);
-    mkdirSync(backup, { recursive: true });
-    copyFileSafe(patchFile, join(backup, "cordis.patch.yml")); // 备份原件
+    if (patchExists) {
+      const backup = join(backupRoot, `patch-${rule.entryId}-${Date.now()}`);
+      mkdirSync(backup, { recursive: true });
+      copyFileSafe(patchFile, join(backup, "cordis.patch.yml")); // 有原件才备份
+    }
     writeFileSync(patchFile, text + block, "utf8");
-    applied.push({ entryId: rule.entryId, backup });
-    info(`组合树守护: 已禁用重复条目 ${rule.entryId}（备份 ${backup}）`);
+    applied.push({ entryId: rule.entryId });
+    info(`组合树守护: 已禁用重复条目 ${rule.entryId}（${patchExists ? "已备份" : "新建 patch 文件"}）`);
   }
   return applied;
 }
@@ -235,13 +236,20 @@ function scanSessionLogs(dshHome) {
   walk(sessionsRoot);
   return bad;
 }
+/** 校验 zstd session 首帧：必须是"恰好一行、以换行结尾"的 header（与 DSH 的
+ * assertZstdHeaderFrame 语义一致：plaintext.indexOf(10) === length-1）。
+ * 用 node:zlib 真实解压第一帧（zstdDecompressSync 只解第一帧）。 */
 function checkZstdFirstFrame(path) {
   try {
     const buf = readFileSync(path);
-    // 用 zstd 解压第一帧不现实（无原生 zstd）；改为二进制探测 magic + 尺寸一致性弱校验。
-    // 这里只做防御性最小检查：文件非空 + 存在 zstd magic
+    if (buf.length === 0) return false;
     const MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
-    return buf.length > 0 && buf.indexOf(MAGIC) === 0;
+    if (buf.indexOf(MAGIC) !== 0) return false;                    // 非 zstd
+    // 解第一帧（node:zlib 对多帧输入只解首帧；对完整单帧输入则全部解出）
+    let plain;
+    try { plain = zstdDecompressSync(buf); }
+    catch { return false; }                                        // 解不了 = 损坏
+    return plain.length > 0 && plain.indexOf(10) === plain.length - 1;
   } catch { return false; }
 }
 

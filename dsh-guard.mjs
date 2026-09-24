@@ -24,6 +24,8 @@
  * 环境变量：
  *   DSH_GUARD_BACKUP_DIR  备份目录（默认 <profile>/.dsh-guard-backup/<ts>）
  *   DSH_GUARD_SKIP_BACKUP  任意非空值 = 跳过备份（不推荐，仅测试）
+ *   DSH_BRANCH_HOME       zDSH 治理存储区根覆盖（0.1.5 扫描面 2；镜像内核权威链
+ *                         DSH_BRANCH_HOME > <DSH_HOME>/zdsh > ~/.dsh-zdsh）
  */
 "use strict";
 
@@ -166,6 +168,99 @@ function fixCoreDuplicates(issues, profileDir) {
   return done;
 }
 function forceJunction() { return process.env.DSH_GUARD_FORCE_JUNCTION === "1"; }
+
+/* ------------------------------------------------------------------ *
+ * 守卫阶段 1b（0.1.5 新增扫描面）：治理存储区核心包物理副本
+ * ------------------------------------------------------------------ */
+
+/** 0.1.5 治理存储区根（zDSH 分支数据区）。镜像主仓权威实现 resolveBranchStorageRoot
+ *  （zDSH-main packages/plugins/plugin-governance/src/persistence/plugin-persistence.ts:42，
+ *  0.1.5-rc.2；DSH_BRANCH_DIR_NAME='.dsh-zdsh' :18）：
+ *    1. DSH_BRANCH_HOME 显式覆盖 → 2. <DSH_HOME>/zdsh 派生 → 3. ~/.dsh-zdsh 历史默认。
+ *  带外 CLI 侧镜像（两仓共享设计不共享代码）；上游权威链变更时须同步本函数。 */
+function resolveStorageRoot() {
+  const branchHome = process.env.DSH_BRANCH_HOME;
+  if (branchHome !== undefined && branchHome.trim().length > 0) return resolve(branchHome);
+  const dshHome = process.env.DSH_HOME;
+  if (dshHome !== undefined && dshHome.trim().length > 0) return join(resolve(dshHome), "zdsh");
+  return join(homedir(), ".dsh-zdsh");
+}
+
+/** 扫描存储区 installed 树下任意深度 node_modules 内的 @deepseek-ai 真实目录副本
+ *  （深潜语义=内核判据 3 的 `installed/**` glob；带外对位面；
+ *  npm: 安装通道物理副本触发面——tarball 解包会把 dependencies 携带的核心包留成真实目录，
+ *  sandbox-b0 探针实证）。通配 @deepseek-ai/* 全作用域（不限 CORE_BUNDLES，与内核判据同形）。
+ *  语义保真：symlink/junction=正常不跟随（原件 isSymlink 判据，兼防链接环）；只读。
+ *  返回 [{ pkg, copyDir, version, pluginDir }]。存储区未材质化=正常（返回空）。 */
+function scanStorageDuplicates(storageRoot) {
+  const issues = [];
+  const installedRoot = join(storageRoot, "installed");
+  if (!existsSync(installedRoot)) return issues;
+  // 权威布局=固定两级 installed/<namespace>/<name>（plugin-governance-host npmInstallDir）
+  let nsList;
+  try { nsList = readdirSync(installedRoot); } catch { return issues; }
+  for (const ns of nsList) {
+    const nsDir = join(installedRoot, ns);
+    if (isSymlink(nsDir) || !isDirSafe(nsDir)) continue;
+    let names;
+    try { names = readdirSync(nsDir); } catch { continue; }
+    for (const name of names) {
+      const pluginDir = join(nsDir, name);
+      if (isSymlink(pluginDir) || !isDirSafe(pluginDir)) continue;
+      walkForCoreCopies(pluginDir, pluginDir, issues);
+    }
+  }
+  return issues;
+}
+function isDirSafe(p) { try { return statSync(p).isDirectory(); } catch { return false; } }
+/** 递归找 node_modules/@deepseek-ai 目录并收集其中真实目录副本（判据 3 的深潜语义）。 */
+function walkForCoreCopies(dir, pluginDir, issues) {
+  let ents;
+  try { ents = readdirSync(dir); } catch { return; }
+  for (const ent of ents) {
+    if (ent === ".dsh-guard-backup") continue;        // 自家备份区不回扫（幂等）
+    const p = join(dir, ent);
+    if (isSymlink(p)) continue;                       // 链接=非本树物理副本，不跟随
+    if (!isDirSafe(p)) continue;
+    if (ent === "@deepseek-ai" && basename(dir) === "node_modules") {
+      let pkgs;
+      try { pkgs = readdirSync(p); } catch { continue; }
+      for (const pkg of pkgs) {
+        const cp = join(p, pkg);
+        if (isSymlink(cp)) continue;                  // junction/symlink=正常
+        if (!isDirSafe(cp)) continue;
+        issues.push({ pkg, copyDir: cp, version: readPkgVersion(cp), pluginDir });
+      }
+      continue;                                       // @deepseek-ai 内部不再深潜
+    }
+    walkForCoreCopies(p, pluginDir, issues);
+  }
+}
+
+/** 修复存储区副本：改名备份移出（不建 junction——存储区上下文无官方层目标；移出后
+ *  未来接线变更命中「依赖不可解析」fail-closed，而非静默 Symbol 隔离）。
+ *  备份落 <storageRoot>/.dsh-guard-backup/<ts>/（或 DSH_GUARD_BACKUP_DIR）；
+ *  SKIP_BACKUP 下拒绝执行（本修复必须有备份落点，fail-closed）。 */
+function fixStorageDuplicates(issues, storageRoot) {
+  if (process.env.DSH_GUARD_SKIP_BACKUP) {
+    throw new Error("DSH_GUARD_SKIP_BACKUP 下拒绝执行存储区副本修复（必须有备份落点）");
+  }
+  const backupRoot = process.env.DSH_GUARD_BACKUP_DIR
+    ? resolve(process.env.DSH_GUARD_BACKUP_DIR)
+    : join(storageRoot, ".dsh-guard-backup", new Date().toISOString().replace(/[:.]/g, "-"));
+  const done = [];
+  let idx = 0;
+  for (const it of issues) {
+    const ts = Date.now();
+    // idx 后缀：同一 pkg 名可出现在多个插件树（同名副本），防同毫秒备份目录冲突
+    const backup = join(backupRoot, `storage-pkg-${it.pkg.replace(/[\\/:]/g, "_")}-${ts}-${idx++}`);
+    mkdirSync(backup, { recursive: true });
+    renameSync(it.copyDir, join(backup, basename(it.copyDir)));  // 改名移出（不删除）
+    done.push({ pkg: it.pkg, backup, from: it.copyDir });
+    info(`修复(存储区): ${it.pkg} ${it.version} 真实副本改名移出（备份 ${backup}）`);
+  }
+  return done;
+}
 
 /* ------------------------------------------------------------------ *
  * 守卫阶段 2：组合树 double-mount 守护
@@ -342,8 +437,10 @@ pnnp install 完成后自动执行本文件的 fix（幂等，无偏差则静默
 
 环境变量:
   DSH_GUARD_BACKUP_DIR   自定义备份根目录（默认 <profile>/.dsh-guard-backup/<ts>）
-  DSH_GUARD_SKIP_BACKUP  =1 跳过备份（仅测试，不推荐）
+  DSH_GUARD_SKIP_BACKUP  =1 跳过备份（仅测试，不推荐；存储区副本修复下拒绝执行）
   DSH_GUARD_FORCE_JUNCTION =1 即使版本相同也强制 junction（默认：版本相同且指向官方层时仍建）
+  DSH_BRANCH_HOME        zDSH 治理存储区根覆盖（0.1.5 扫描面 2；镜像内核权威链:
+                         DSH_BRANCH_HOME > <DSH_HOME>/zdsh > ~/.dsh-zdsh）
 `);
 }
 
@@ -371,6 +468,7 @@ async function main() {
 
   info(`DSH_HOME=${dshHome}`);
   info(`profile=${profileDir}`);
+  info(`storageRoot=${resolveStorageRoot()}`);
 
   try {
     switch (args.cmd) {
@@ -387,7 +485,7 @@ async function main() {
       case "check": {
         const r = await runCheck(profileDir, dshHome);
         report(r);
-        const hasIssue = r.core.length || r.doubles.length || r.sessions.length;
+        const hasIssue = r.core.length || r.doubles.length || r.sessions.length || r.storage.length;
         process.exit(hasIssue ? 1 : 0);
         break;
       }
@@ -413,13 +511,18 @@ async function runCheck(profileDir, dshHome) {
   const core = scanCoreDuplicates(profileDir, dshHome);
   const dm = scanDoubleMounts(profileDir);
   const sl = process.env.DSH_GUARD_CHECK_SESSIONS === "1" ? scanSessionLogs(dshHome) : [];
-  return { core, doubles: dm, sessions: sl };
+  const storage = scanStorageDuplicates(resolveStorageRoot());   // 0.1.5 扫描面 2（判据 3 对位）
+  return { core, doubles: dm, sessions: sl, storage };
 }
 function report(r) {
-  if (!r.core.length && !r.doubles.length && !r.sessions.length) { info("体检通过：无偏差"); return; }
+  if (!r.core.length && !r.doubles.length && !r.sessions.length && !r.storage.length) { info("体检通过：无偏差"); return; }
   if (r.core.length) {
     warn("核心包重复副本（需 junction 修复）:");
     for (const c of r.core) error(`  ${c.pkg}: profile=${c.realVersion} / 官方=${c.officialVersion} @ ${c.realDir}`);
+  }
+  if (r.storage.length) {
+    warn("治理存储区核心包物理副本（npm: 安装通道；修复=备份改名移出，无 junction）:");
+    for (const s of r.storage) error(`  ${s.pkg}@${s.version} @ ${s.copyDir}（插件树 ${s.pluginDir}）`);
   }
   if (r.doubles.length) {
     warn("组合树 double-mount（需追加 disabled）:");
@@ -434,8 +537,11 @@ async function runFix(profileDir, dshHome) {
   const core = scanCoreDuplicates(profileDir, dshHome);
   const dm = scanDoubleMounts(profileDir);
   const sl = process.env.DSH_GUARD_FIX_SESSIONS === "1" ? scanSessionLogs(dshHome) : [];
-  if (!core.length && !dm.length && !sl.length) { info("unclean 检查通过：无需修复"); return 0; }
+  const storageRoot = resolveStorageRoot();
+  const storage = scanStorageDuplicates(storageRoot);
+  if (!core.length && !dm.length && !sl.length && !storage.length) { info("unclean 检查通过：无需修复"); return 0; }
   if (core.length) fixCoreDuplicates(core, profileDir);
+  if (storage.length) fixStorageDuplicates(storage, storageRoot);
   if (dm.length) applyDoubleMountFixes(dm, profileDir);
   if (sl.length) warn(`session 日志异常 ${sl.length} 个（需人工处理，dsh-guard 不擅自改写数据）`);
   info("fix 完成");
@@ -449,6 +555,9 @@ function status(profileDir) {
   if (existsSync(backupRoot)) info(`历史备份目录: ${backupRoot}（${readdirSync(backupRoot).length} 次）`);
   const core = scanCoreDuplicates(profileDir, findDshHome());
   info(`核心包重复副本: ${core.length ? core.map(c=>c.pkg).join(", ") : "无 ✓"}`);
+  const storageRoot = resolveStorageRoot();
+  const storage = scanStorageDuplicates(storageRoot);
+  info(`存储区核心包物理副本（${storageRoot}）: ${storage.length ? storage.map(s=>`${s.pkg}@${s.version}`).join(", ") : "无 ✓"}`);
   const dm = scanDoubleMounts(profileDir);
   info(`待禁用的 double-mount: ${dm.length ? dm.map(d=>d.entryId).join(", ") : "无 ✓"}`);
 }

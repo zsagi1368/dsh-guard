@@ -89,6 +89,13 @@ writeFileSync(join(web, "node_modules", "dsh-better-sidebar", "package.json"),
   JSON.stringify({ name: "dsh-better-sidebar", version: "0.13.0" }));
 // 手动移除 profile 层已加的禁用（回到初始态）
 writeFileSync(join(web, "cordis.patch.yml"), "# fixture\n");
+// 负向：聚合包不在盘 → 重复条目不可能存在 → 规则必须跳过（2026-10-29 误报修复）
+r = run(["check", "--profile", web]);
+ok(!/web-ui-better-sidebar/.test(r.stdout), "聚合包缺席时 check 不误报 double-mount");
+// 正向：聚合包在盘 → 重复条目真实存在 → 检出
+mkdirSync(join(web, "node_modules", "@linxin666", "dsh-web-ui-all"), { recursive: true });
+writeFileSync(join(web, "node_modules", "@linxin666", "dsh-web-ui-all", "package.json"),
+  JSON.stringify({ name: "@linxin666/dsh-web-ui-all", version: "1.0.0" }));
 r = run(["check", "--profile", web]);
 ok(/web-ui-better-sidebar/.test(r.stdout), "check 检出 double-mount");
 r = run(["fix", "--profile", web]);

@@ -59,9 +59,14 @@ const CORE_BUNDLES = [
 
 /** 已知 double-mount 冲突规则表（可幂等增补）。
  *  entryId: 聚合 patch 引入的重复条目 id；
- *  name: 该条目指向的插件名（用于验证仍指向同一插件才禁用）。 */
+ *  name: 该条目指向的插件名（用于验证仍指向同一插件才禁用）；
+ *  aggregate: 引入该条目的聚合包——**聚合包不在盘时规则必须跳过**，否则每个
+ *  只装了 name 包的 profile 都会误报 double-mount（2026-10-29 审计实证：
+ *  只装 better-sidebar、未装聚合包的 profile 被 ERROR，fix 还会往用户
+ *  patch 写入指向不存在条目的 disabled 块）。 */
 const KNOWN_DOUBLE_MOUNTS = [
   { entryId: "web-ui-better-sidebar", name: "dsh-better-sidebar",
+    aggregate: "@linxin666/dsh-web-ui-all",
     why: "@linxin666/dsh-web-ui-all 聚合 patch 重复挂载已单独安装的 dsh-better-sidebar" },
 ];
 
@@ -266,13 +271,17 @@ function fixStorageDuplicates(issues, storageRoot) {
  * 守卫阶段 2：组合树 double-mount 守护
  * ------------------------------------------------------------------ */
 
-/** 检查已知 double-mount 条目是否已被 profile 层禁用；返回需要补充禁用的列表。 */
+/** 检查已知 double-mount 条目是否已被 profile 层禁用；返回需要补充禁用的列表。
+ *  前置闸：规则声明了 aggregate 时，聚合包必须真实在盘——聚合 patch 只在
+ *  聚合包安装时才贡献重复条目；聚合包缺席的 profile 无冲突可言。 */
 function scanDoubleMounts(profileDir) {
   const patchFile = join(profileDir, "cordis.patch.yml");
   let patchText = "";
   if (existsSync(patchFile)) patchText = readFileSync(patchFile, "utf8");
   const missing = [];
   for (const rule of KNOWN_DOUBLE_MOUNTS) {
+    // 聚合包不在盘 → 该重复条目不可能出现在组合树里，规则跳过（防误报）。
+    if (rule.aggregate && !existsSync(join(profileDir, "node_modules", ...rule.aggregate.split("/")))) continue;
     // 已存在该条目的 disabled 块？
     const re = new RegExp(`-\\s*id:\\s*${escapeRegExp(rule.entryId)}\\s*\\n[ \\t]+disabled:\\s*true`);
     if (re.test(patchText)) continue;             // 已禁用 ✓
